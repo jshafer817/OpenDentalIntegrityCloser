@@ -1,45 +1,53 @@
 ﻿using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
-using System.Reflection;
-using System.IO;
+using Microsoft.Win32;
 
 namespace OpenDentalIntegrityCloser
 {
     static class Program
     {
+        private static Mutex _mutex;
+
         [STAThread]
         static void Main()
         {
+            bool createdNew;
+            _mutex = new Mutex(true, "OpenDentalIntegrityCloserMutex", out createdNew);
+            if (!createdNew)
+            {
+                return; // already running
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new TrayAppContext());
+
+            GC.KeepAlive(_mutex);
         }
     }
 
     public class TrayAppContext : ApplicationContext
     {
         private readonly NotifyIcon _notifyIcon;
-        private readonly Timer _timer;
+        private readonly System.Windows.Forms.Timer _timer;
         private readonly MenuItem _pauseMenuItem;
         private readonly MenuItem _startupMenuItem;
 
         private bool _paused = false;
+        private bool _isHandlingTick = false;
 
-        // Adjust these if you want
         private const int CheckIntervalMs = 1500;
-
-        // Main window title must contain this
+        private const string OpenDentalProcessName = "OpenDental";
         private const string OpenDentalTitleMatch = "Open Dental";
-
-        // Popup/dialog title must contain this
         private const string DialogTitleMatch = "Database Integrity";
-
-        // Optional text match inside the dialog. Leave empty to close any "Database Integrity" dialog.
         private const string RequiredDialogTextMatch =
             "Open Dental has detected that this patient's data has been modified";
 
@@ -48,14 +56,14 @@ namespace OpenDentalIntegrityCloser
             ContextMenu menu = new ContextMenu();
 
             _pauseMenuItem = new MenuItem("Pause", OnPauseResumeClicked);
-            MenuItem exitMenuItem = new MenuItem("Exit", OnExitClicked);
             _startupMenuItem = new MenuItem("Run at Startup", OnStartupClicked);
             _startupMenuItem.Checked = StartupManager.IsStartupEnabled();
+            MenuItem exitMenuItem = new MenuItem("Exit", OnExitClicked);
 
             menu.MenuItems.Add(_pauseMenuItem);
             menu.MenuItems.Add(_startupMenuItem);
             menu.MenuItems.Add("-");
-            menu.MenuItems.Add(exitMenuItem);                        
+            menu.MenuItems.Add(exitMenuItem);
 
             _notifyIcon = new NotifyIcon
             {
@@ -65,18 +73,27 @@ namespace OpenDentalIntegrityCloser
                 Visible = true
             };
 
-            _timer = new Timer();
+            _timer = new System.Windows.Forms.Timer();
             _timer.Interval = CheckIntervalMs;
             _timer.Tick += Timer_Tick;
             _timer.Start();
+
+            Log("Application started.");
         }
 
         private void OnStartupClicked(object sender, EventArgs e)
         {
-            bool enable = !_startupMenuItem.Checked;
-
-            StartupManager.SetStartup(enable);
-            _startupMenuItem.Checked = enable;
+            try
+            {
+                bool enable = !_startupMenuItem.Checked;
+                StartupManager.SetStartup(enable);
+                _startupMenuItem.Checked = enable;
+                Log("Run at Startup set to " + enable + ".");
+            }
+            catch (Exception ex)
+            {
+                Log("OnStartupClicked error: " + ex);
+            }
         }
 
         private void OnPauseResumeClicked(object sender, EventArgs e)
@@ -86,13 +103,24 @@ namespace OpenDentalIntegrityCloser
             _notifyIcon.Text = _paused
                 ? "OpenDental Integrity Closer (Paused)"
                 : "OpenDental Integrity Closer";
+
+            Log("Paused set to " + _paused + ".");
         }
 
         private void OnExitClicked(object sender, EventArgs e)
         {
-            _timer.Stop();
-            _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
+            try
+            {
+                _timer.Stop();
+                _notifyIcon.Visible = false;
+                _notifyIcon.Dispose();
+                Log("Application exiting.");
+            }
+            catch (Exception ex)
+            {
+                Log("OnExitClicked error: " + ex);
+            }
+
             ExitThread();
         }
 
@@ -101,36 +129,58 @@ namespace OpenDentalIntegrityCloser
             if (_paused)
                 return;
 
+            if (_isHandlingTick)
+                return;
+
+            _isHandlingTick = true;
+
             try
             {
-                if (!AnyTopLevelWindowContains(OpenDentalTitleMatch))
+                if (!IsAnyOpenDentalMainWindowPresent())
                     return;
 
-                IntPtr dialogHwnd = FindTopLevelWindowContaining(DialogTitleMatch);
+                IntPtr dialogHwnd = FindOpenDentalDialogWindow(DialogTitleMatch);
                 if (dialogHwnd == IntPtr.Zero)
                     return;
 
-                string dialogText = ReadDialogText(dialogHwnd);
+                if (!IsWindow(dialogHwnd) || !IsWindowVisible(dialogHwnd))
+                    return;
 
-                // Bonus: only close if the text matches
+                if (!IsOpenDentalWindow(dialogHwnd))
+                    return;
+
+                string dialogText = ReadDialogText(dialogHwnd);
+                if (string.IsNullOrWhiteSpace(dialogText))
+                {
+                    Log("Dialog found but no text could be read.");
+                    return;
+                }
+
                 if (!string.IsNullOrWhiteSpace(RequiredDialogTextMatch))
                 {
-                    if (string.IsNullOrWhiteSpace(dialogText))
-                        return;
-
                     if (dialogText.IndexOf(RequiredDialogTextMatch, StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        Log("Dialog title matched but text did not match. Text read: " + SanitizeForLog(dialogText));
                         return;
+                    }
                 }
+
+                if (!IsWindow(dialogHwnd) || !IsWindowVisible(dialogHwnd))
+                    return;
 
                 CloseDialog(dialogHwnd);
             }
-            catch
+            catch (Exception ex)
             {
-                // Swallow exceptions so tray app keeps running
+                Log("Timer_Tick error: " + ex);
+            }
+            finally
+            {
+                _isHandlingTick = false;
             }
         }
 
-        private static bool AnyTopLevelWindowContains(string titlePart)
+        private static bool IsAnyOpenDentalMainWindowPresent()
         {
             bool found = false;
 
@@ -139,9 +189,12 @@ namespace OpenDentalIntegrityCloser
                 if (!IsWindowVisible(hWnd))
                     return true;
 
+                if (!IsOpenDentalWindow(hWnd))
+                    return true;
+
                 string title = GetWindowTitle(hWnd);
                 if (!string.IsNullOrWhiteSpace(title) &&
-                    title.IndexOf(titlePart, StringComparison.OrdinalIgnoreCase) >= 0)
+                    title.IndexOf(OpenDentalTitleMatch, StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     found = true;
                     return false;
@@ -153,13 +206,16 @@ namespace OpenDentalIntegrityCloser
             return found;
         }
 
-        private static IntPtr FindTopLevelWindowContaining(string titlePart)
+        private static IntPtr FindOpenDentalDialogWindow(string titlePart)
         {
             IntPtr foundHwnd = IntPtr.Zero;
 
             EnumWindows(delegate (IntPtr hWnd, IntPtr lParam)
             {
                 if (!IsWindowVisible(hWnd))
+                    return true;
+
+                if (!IsOpenDentalWindow(hWnd))
                     return true;
 
                 string title = GetWindowTitle(hWnd);
@@ -176,9 +232,30 @@ namespace OpenDentalIntegrityCloser
             return foundHwnd;
         }
 
+        private static bool IsOpenDentalWindow(IntPtr hWnd)
+        {
+            try
+            {
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (pid == 0)
+                    return false;
+
+                Process proc = Process.GetProcessById((int)pid);
+                return proc.ProcessName.Equals(OpenDentalProcessName, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static string GetWindowTitle(IntPtr hWnd)
         {
             int len = GetWindowTextLength(hWnd);
+            if (len <= 0)
+                return string.Empty;
+
             StringBuilder sb = new StringBuilder(len + 1);
             GetWindowText(hWnd, sb, sb.Capacity);
             return sb.ToString();
@@ -186,23 +263,26 @@ namespace OpenDentalIntegrityCloser
 
         private static void CloseDialog(IntPtr dialogHwnd)
         {
-            // First try to find and click an OK button
+            if (!IsWindow(dialogHwnd))
+                return;
+
             IntPtr okButton = FindChildButton(dialogHwnd, "OK");
-            if (okButton != IntPtr.Zero)
+            if (okButton != IntPtr.Zero && IsWindow(okButton))
             {
+                Log("Clicking OK button on dialog.");
                 SendMessage(okButton, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
                 return;
             }
 
-            // Try any button if OK not found
             IntPtr anyButton = FindFirstButton(dialogHwnd);
-            if (anyButton != IntPtr.Zero)
+            if (anyButton != IntPtr.Zero && IsWindow(anyButton))
             {
+                Log("OK button not found. Clicking first button on dialog.");
                 SendMessage(anyButton, BM_CLICK, IntPtr.Zero, IntPtr.Zero);
                 return;
             }
 
-            // Fallback
+            Log("No button found. Sending WM_CLOSE to dialog.");
             PostMessage(dialogHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
         }
 
@@ -212,6 +292,9 @@ namespace OpenDentalIntegrityCloser
 
             EnumChildWindows(parentHwnd, delegate (IntPtr hWnd, IntPtr lParam)
             {
+                if (!IsWindow(hWnd))
+                    return true;
+
                 string cls = GetClassNameString(hWnd);
                 if (!string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase))
                     return true;
@@ -236,6 +319,9 @@ namespace OpenDentalIntegrityCloser
 
             EnumChildWindows(parentHwnd, delegate (IntPtr hWnd, IntPtr lParam)
             {
+                if (!IsWindow(hWnd))
+                    return true;
+
                 string cls = GetClassNameString(hWnd);
                 if (string.Equals(cls, "Button", StringComparison.OrdinalIgnoreCase))
                 {
@@ -265,13 +351,11 @@ namespace OpenDentalIntegrityCloser
             if (!string.IsNullOrWhiteSpace(text))
                 return text;
 
-            // Fallback
             int len = GetWindowTextLength(hWnd);
             if (len > 0)
             {
-                sb.Clear();
-                sb.EnsureCapacity(len + 1);
-                GetWindowText(hWnd, sb, len + 1);
+                sb = new StringBuilder(len + 1);
+                GetWindowText(hWnd, sb, sb.Capacity);
                 text = sb.ToString();
             }
 
@@ -280,9 +364,11 @@ namespace OpenDentalIntegrityCloser
 
         private static string ReadDialogText(IntPtr dialogHwnd)
         {
+            if (!IsWindow(dialogHwnd))
+                return string.Empty;
+
             StringBuilder allText = new StringBuilder();
 
-            // 1) Try UI Automation first (best for WPF/custom dialogs)
             try
             {
                 AutomationElement root = AutomationElement.FromHandle(dialogHwnd);
@@ -294,8 +380,7 @@ namespace OpenDentalIntegrityCloser
                         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane)
                     );
 
-                    AutomationElementCollection elements =
-                        root.FindAll(TreeScope.Descendants, cond);
+                    AutomationElementCollection elements = root.FindAll(TreeScope.Descendants, cond);
 
                     for (int i = 0; i < elements.Count; i++)
                     {
@@ -313,15 +398,18 @@ namespace OpenDentalIntegrityCloser
                     }
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                Log("UI Automation read failed: " + ex.Message);
             }
 
-            // 2) Fallback to Win32 child text scraping
             if (allText.Length == 0)
             {
                 EnumChildWindows(dialogHwnd, delegate (IntPtr hWnd, IntPtr lParam)
                 {
+                    if (!IsWindow(hWnd))
+                        return true;
+
                     string text = GetControlText(hWnd);
                     if (!string.IsNullOrWhiteSpace(text))
                     {
@@ -331,7 +419,6 @@ namespace OpenDentalIntegrityCloser
                 }, IntPtr.Zero);
             }
 
-            // 3) Final fallback to window caption
             if (allText.Length == 0)
             {
                 string caption = GetWindowTitle(dialogHwnd);
@@ -339,7 +426,28 @@ namespace OpenDentalIntegrityCloser
                     allText.AppendLine(caption);
             }
 
-            return allText.ToString();
+            return allText.ToString().Trim();
+        }
+
+        private static void Log(string message)
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "OpenDentalIntegrityCloser.log");
+                File.AppendAllText(path,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + " - " + message + Environment.NewLine);
+            }
+            catch
+            {
+            }
+        }
+
+        private static string SanitizeForLog(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            return text.Replace("\r", " ").Replace("\n", " ").Trim();
         }
 
         #region Win32
@@ -365,8 +473,14 @@ namespace OpenDentalIntegrityCloser
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, StringBuilder lParam);
@@ -379,4 +493,5 @@ namespace OpenDentalIntegrityCloser
 
         #endregion
     }
+        
 }
